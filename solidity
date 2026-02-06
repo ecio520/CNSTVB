@@ -1,0 +1,452 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/security/Pausable.sol";
+
+/**
+ * @title CNSTVB - 中国电视区块链虚拟货币
+ * @dev 基于ERC-20标准的CNSTVB代币合约
+ * @notice 代币全称: China TV Blockchain (CNSTVB)
+ * @notice 代币简称: CNTV
+ */
+contract CNSTVB is ERC20, Ownable, ReentrancyGuard, Pausable {
+    
+    // 代币基本信息
+    string public constant NAME = "China TV Blockchain";
+    string public constant SYMBOL = "CNTV";
+    uint8 public constant DECIMALS = 18;
+    
+    // 初始供应量配置
+    uint256 private constant INITIAL_SUPPLY = 10_000_000_000 * (10 ** uint256(DECIMALS)); // 100亿枚
+    uint256 public maxSupply = 21_000_000_000 * (10 ** uint256(DECIMALS)); // 最大供应量210亿枚
+    
+    // 经济模型参数
+    uint256 public transactionFeePercent = 1; // 默认1%交易手续费
+    uint256 public burnRatePercent = 2; // 2%销毁率（从手续费中销毁）
+    address public treasuryWallet; // 财政部钱包
+    address public marketingWallet; // 市场推广钱包
+    
+    // 治理参数
+    bool public tradingEnabled = false; // 交易开关
+    uint256 public launchTime; // 上线时间
+    mapping(address => bool) public authorizedTraders; // 授权交易者
+    
+    // 持有者福利系统
+    mapping(address => uint256) public stakingPoints; // 质押积分
+    mapping(address => uint256) public holdingSince; // 持有开始时间
+    uint256 public stakingAPY = 12; // 年化收益率12%
+    
+    // 反鲸鱼机制
+    mapping(address => bool) public isWhaleRestricted; // 鲸鱼限制
+    uint256 public whaleThreshold = 500_000_000 * (10 ** uint256(DECIMALS)); // 5亿CNTV触发限制
+    
+    // 事件定义
+    event TradingEnabled();
+    event TradingDisabled();
+    event TreasuryWalletUpdated(address indexed newWallet);
+    event MarketingWalletUpdated(address indexed newWallet);
+    event TransactionFeeUpdated(uint256 newFeePercent);
+    event BurnRateUpdated(uint256 newBurnRate);
+    event AuthorizedTraderUpdated(address indexed trader, bool authorized);
+    event WhaleRestrictionUpdated(address indexed account, bool restricted);
+    event StakingPointsUpdated(address indexed account, uint256 points);
+    event TokensBurned(address indexed burner, uint256 amount);
+    event TokensMinted(address indexed to, uint256 amount);
+    event TokensDistributed(address indexed recipient, uint256 amount, string reason);
+    
+    /**
+     * @dev 构造函数 - 初始化CNSTVB合约
+     * @param _treasuryWallet 财政部钱包地址
+     * @param _marketingWallet 市场推广钱包地址
+     */
+    constructor(address _treasuryWallet, address _marketingWallet) ERC20(NAME, SYMBOL) {
+        require(_treasuryWallet != address(0), "Treasury wallet cannot be zero");
+        require(_marketingWallet != address(0), "Marketing wallet cannot be zero");
+        
+        treasuryWallet = _treasuryWallet;
+        marketingWallet = _marketingWallet;
+        
+        // 铸造初始供应量给合约部署者
+        _mint(msg.sender, INITIAL_SUPPLY);
+        
+        // 设置部署者为第一个持有者
+        holdingSince[msg.sender] = block.timestamp;
+        
+        emit TokensMinted(msg.sender, INITIAL_SUPPLY);
+        emit TokensDistributed(msg.sender, INITIAL_SUPPLY, "Initial Distribution");
+    }
+    
+    /**
+     * @dev 启用交易功能（仅限所有者）
+     */
+    function enableTrading() external onlyOwner {
+        require(!tradingEnabled, "Trading already enabled");
+        tradingEnabled = true;
+        launchTime = block.timestamp;
+        emit TradingEnabled();
+    }
+    
+    /**
+     * @dev 禁用交易功能（仅限所有者）
+     */
+    function disableTrading() external onlyOwner {
+        require(tradingEnabled, "Trading already disabled");
+        tradingEnabled = false;
+        emit TradingDisabled();
+    }
+    
+    /**
+     * @dev 授权交易者（白名单机制）
+     */
+    function setAuthorizedTrader(address trader, bool authorized) external onlyOwner {
+        require(trader != address(0), "Trader cannot be zero address");
+        authorizedTraders[trader] = authorized;
+        emit AuthorizedTraderUpdated(trader, authorized);
+    }
+    
+    /**
+     * @dev 重写转账函数 - 包含完整经济模型
+     */
+    function _transfer(
+        address from,
+        address to,
+        uint256 amount
+    ) internal override nonReentrant whenNotPaused {
+        require(from != address(0), "Transfer from zero address");
+        require(to != address(0), "Transfer to zero address");
+        require(amount > 0, "Transfer amount must be greater than 0");
+        
+        // 检查交易开关
+        if (!tradingEnabled && from != owner() && to != owner()) {
+            revert("Trading not enabled");
+        }
+        
+        // 检查授权交易者
+        if (!authorizedTraders[from] && !authorizedTraders[to] && 
+            from != owner() && to != owner()) {
+            revert("Trader not authorized");
+        }
+        
+        // 反鲸鱼检查
+        if (!authorizedTraders[from] && balanceOf(from) >= whaleThreshold) {
+            if (!isWhaleRestricted[from]) {
+                isWhaleRestricted[from] = true;
+                emit WhaleRestrictionUpdated(from, true);
+            }
+            // 鲸鱼交易需要特殊授权
+            require(authorizedTraders[from], "Whale transfer requires authorization");
+        }
+        
+        uint256 fee = 0;
+        uint256 burnAmount = 0;
+        uint256 netAmount = amount;
+        
+        // 计算手续费（排除特殊情况）
+        if (shouldChargeFee(from, to)) {
+            fee = (amount * transactionFeePercent) / 100;
+            
+            // 计算销毁金额
+            burnAmount = (fee * burnRatePercent) / 100;
+            
+            // 净手续费（扣除销毁部分）
+            uint256 netFee = fee - burnAmount;
+            
+            // 分配手续费
+            if (netFee > 0) {
+                distributeFees(netFee, from);
+            }
+            
+            // 执行销毁
+            if (burnAmount > 0) {
+                _burn(from, burnAmount);
+                emit TokensBurned(from, burnAmount);
+            }
+            
+            netAmount = amount - fee;
+        }
+        
+        // 执行转账
+        super._transfer(from, to, netAmount);
+        
+        // 更新持有者信息
+        updateHolderInfo(from, to);
+        
+        // 更新质押积分
+        updateStakingPoints(from, to, netAmount);
+    }
+    
+    /**
+     * @dev 判断是否应该收取手续费
+     */
+    function shouldChargeFee(address from, address to) internal view returns (bool) {
+        return from != owner() && 
+               to != owner() && 
+               to != treasuryWallet && 
+               to != marketingWallet &&
+               to != address(0) &&
+               !authorizedTraders[from];
+    }
+    
+    /**
+     * @dev 分配手续费到不同钱包
+     */
+    function distributeFees(uint256 netFee, address from) internal {
+        uint256 treasuryShare = (netFee * 60) / 100; // 财政部60%
+        uint256 marketingShare = (netFee * 30) / 100; // 市场部30%
+        uint256 devShare = netFee - treasuryShare - marketingShare; // 开发团队10%
+        
+        if (treasuryShare > 0) {
+            super._transfer(from, treasuryWallet, treasuryShare);
+        }
+        
+        if (marketingShare > 0) {
+            super._transfer(from, marketingWallet, marketingShare);
+        }
+        
+        if (devShare > 0) {
+            super._transfer(from, owner(), devShare);
+        }
+    }
+    
+    /**
+     * @dev 更新持有者信息
+     */
+    function updateHolderInfo(address from, address to) internal {
+        // 更新转出方持有时间
+        if (balanceOf(from) == 0) {
+            holdingSince[from] = 0;
+        }
+        
+        // 更新转入方持有时间
+        if (holdingSince[to] == 0 && balanceOf(to) > 0) {
+            holdingSince[to] = block.timestamp;
+        }
+    }
+    
+    /**
+     * @dev 更新质押积分
+     */
+    function updateStakingPoints(address from, address to, uint256 amount) internal {
+        // 减少转出方积分（按持有时间加权）
+        if (balanceOf(from) > 0 && holdingSince[from] > 0) {
+            uint256 holdDuration = block.timestamp - holdingSince[from];
+            uint256 pointsToDeduct = calculatePoints(amount, holdDuration);
+            stakingPoints[from] = stakingPoints[from] > pointsToDeduct ? 
+                                stakingPoints[from] - pointsToDeduct : 0;
+        }
+        
+        // 增加转入方积分
+        if (balanceOf(to) > 0) {
+            uint256 holdDuration = block.timestamp - holdingSince[to];
+            uint256 pointsToAdd = calculatePoints(amount, holdDuration);
+            stakingPoints[to] += pointsToAdd;
+            emit StakingPointsUpdated(to, stakingPoints[to]);
+        }
+    }
+    
+    /**
+     * @dev 计算质押积分
+     */
+    function calculatePoints(uint256 amount, uint256 duration) internal pure returns (uint256) {
+        // 简化的积分计算：金额 × 时间权重
+        return (amount * duration) / 1 days; // 按天计算
+    }
+    
+    /**
+     * @dev 铸造新代币（仅所有者，有上限）
+     */
+    function mint(address to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Mint to zero address");
+        require(amount > 0, "Amount must be greater than 0");
+        require(totalSupply() + amount <= maxSupply, "Exceeds max supply");
+        
+        _mint(to, amount);
+        emit TokensMinted(to, amount);
+    }
+    
+    /**
+     * @dev 销毁代币
+     */
+    function burn(uint256 amount) external {
+        require(amount > 0, "Burn amount must be greater than 0");
+        require(balanceOf(msg.sender) >= amount, "Insufficient balance");
+        
+        _burn(msg.sender, amount);
+        emit TokensBurned(msg.sender, amount);
+    }
+    
+    /**
+     * @dev 批量空投分发
+     */
+    function airdrop(address[] calldata recipients, uint256[] calldata amounts, string memory reason) external onlyOwner {
+        require(recipients.length == amounts.length, "Array length mismatch");
+        require(recipients.length > 0, "Empty array");
+        
+        uint256 totalAmount = 0;
+        for (uint256 i = 0; i < amounts.length; i++) {
+            require(recipients[i] != address(0), "Invalid recipient");
+            require(amounts[i] > 0, "Invalid amount");
+            totalAmount += amounts[i];
+        }
+        
+        require(balanceOf(msg.sender) >= totalAmount, "Insufficient balance");
+        
+        for (uint256 i = 0; i < recipients.length; i++) {
+            _transfer(msg.sender, recipients[i], amounts[i]);
+            emit TokensDistributed(recipients[i], amounts[i], reason);
+        }
+    }
+    
+    /**
+     * @dev 更新财政部钱包
+     */
+    function setTreasuryWallet(address newWallet) external onlyOwner {
+        require(newWallet != address(0), "Treasury wallet cannot be zero");
+        treasuryWallet = newWallet;
+        emit TreasuryWalletUpdated(newWallet);
+    }
+    
+    /**
+     * @dev 更新市场推广钱包
+     */
+    function setMarketingWallet(address newWallet) external onlyOwner {
+        require(newWallet != address(0), "Marketing wallet cannot be zero");
+        marketingWallet = newWallet;
+        emit MarketingWalletUpdated(newWallet);
+    }
+    
+    /**
+     * @dev 更新手续费率
+     */
+    function setTransactionFeePercent(uint256 newFeePercent) external onlyOwner {
+        require(newFeePercent <= 5, "Fee percent too high"); // 最大5%
+        transactionFeePercent = newFeePercent;
+        emit TransactionFeeUpdated(newFeePercent);
+    }
+    
+    /**
+     * @dev 更新销毁率
+     */
+    function setBurnRatePercent(uint256 newBurnRate) external onlyOwner {
+        require(newBurnRate <= 50, "Burn rate too high"); // 最大50%
+        burnRatePercent = newBurnRate;
+        emit BurnRateUpdated(newBurnRate);
+    }
+    
+    /**
+     * @dev 更新鲸鱼阈值
+     */
+    function setWhaleThreshold(uint256 newThreshold) external onlyOwner {
+        require(newThreshold > 0, "Threshold must be greater than 0");
+        whaleThreshold = newThreshold;
+    }
+    
+    /**
+     * @dev 手动解除鲸鱼限制
+     */
+    function removeWhaleRestriction(address account) external onlyOwner {
+        isWhaleRestricted[account] = false;
+        emit WhaleRestrictionUpdated(account, false);
+    }
+    
+    /**
+     * @dev 暂停合约
+     */
+    function pause() external onlyOwner {
+        _pause();
+    }
+    
+    /**
+     * @dev 恢复合约
+     */
+    function unpause() external onlyOwner {
+        _unpause();
+    }
+    
+    /**
+     * @dev 获取CNSTVB代币详细信息
+     */
+    function getTokenInfo() external view returns (
+        string memory name,
+        string memory symbol,
+        uint8 decimals,
+        uint256 totalSupply,
+        uint256 maxSupply,
+        uint256 initialSupply,
+        uint256 transactionFeePercent,
+        uint256 burnRatePercent,
+        bool tradingEnabled,
+        uint256 launchTime,
+        uint256 stakingAPY
+    ) {
+        return (
+            NAME,
+            SYMBOL,
+            DECIMALS,
+            totalSupply(),
+            maxSupply,
+            INITIAL_SUPPLY,
+            transactionFeePercent,
+            burnRatePercent,
+            tradingEnabled,
+            launchTime,
+            stakingAPY
+        );
+    }
+    
+    /**
+     * @dev 获取账户详细信息
+     */
+    function getAccountDetails(address account) external view returns (
+        uint256 balance,
+        uint256 stakingPointsValue,
+        uint256 holdingDays,
+        bool isWhaleRestrictedStatus,
+        bool isAuthorizedTrader,
+        uint256 estimatedRewards
+    ) {
+        uint256 holdDuration = holdingSince[account] > 0 ? 
+                             block.timestamp - holdingSince[account] : 0;
+        
+        return (
+            balanceOf(account),
+            stakingPoints[account],
+            holdDuration / 1 days,
+            isWhaleRestricted[account],
+            authorizedTraders[account],
+            calculateEstimatedRewards(account)
+        );
+    }
+    
+    /**
+     * @dev 计算预估奖励
+     */
+    function calculateEstimatedRewards(address account) internal view returns (uint256) {
+        if (balanceOf(account) == 0 || holdingSince[account] == 0) {
+            return 0;
+        }
+        
+        uint256 holdDuration = block.timestamp - holdingSince[account];
+        uint256 annualReward = (balanceOf(account) * stakingAPY) / 100;
+        uint256 dailyReward = annualReward / 365;
+        
+        return (dailyReward * holdDuration) / 1 days;
+    }
+    
+    /**
+     * @dev 获取网络统计数据
+     */
+    function getNetworkStats() external view returns (
+        uint256 totalHolders,
+        uint256 totalTransactions,
+        uint256 totalFeesCollected,
+        uint256 totalTokensBurned,
+        uint256 currentAPY
+    ) {
+        // 注意：这些统计数据需要在实际使用中通过事件或额外存储来维护
+        return (0, 0, 0, 0, stakingAPY);
+    }
+}
