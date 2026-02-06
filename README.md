@@ -1,0 +1,2 @@
+# CNSTVB
+CNSTVB（简称 CNTV）基于ERC-20标准的CNSTVB代币合约
